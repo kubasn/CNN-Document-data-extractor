@@ -1,0 +1,638 @@
+# import tensorflow as tf
+# from tensorflow import keras
+# from tensorflow.keras.preprocessing import image
+# import numpy as np
+# import matplotlib.pyplot as plt
+# from PIL import Image, ImageOps
+# from tensorflow.keras.models import load_model
+# # from ./ import utils as ut
+# import sys
+# sys.path.append("..") # Adds higher directory to python modules path.
+# import utils as ut
+# import keras_ocr
+# import easyocr
+# reader = easyocr.Reader(['en','pl'], gpu = True)
+# import cv2
+# import pytesseract
+import os
+# import tensorflow as tf
+# import re
+# import pandas as pd
+import glob
+import multiprocessing as mp
+
+import sys
+sys.path.append("..") # Adds higher directory to python modules path.
+import utils as ut
+import cv2
+import pytesseract
+from pytesseract import Output
+import math
+import numpy as np
+from itertools import filterfalse
+import time
+from openpyxl import Workbook
+import argparse
+import ntpath
+import easyocr
+reader = easyocr.Reader(['en','pl'], gpu = True)
+
+
+
+def execute_main():
+    image_dir = "images_classification"  # replace with your directory
+    images = glob.glob(os.path.join(image_dir, "table_*.jpg"))
+    print(image_dir)
+    
+    # create a pool of workers
+    with mp.Pool(mp.cpu_count()) as pool:
+        results = []
+        for img_path in images:
+            filename = os.path.basename(img_path)  # get the name of the file
+            number_str = filename.split('_')[1].split('.')[0]  # split the filename by '_' and '.'
+            number = int(number_str)  # convert the number to an integer
+            print(filename, number)
+            # apply the function to each image asynchronously
+            result = pool.apply_async(extract, args=(img_path, number))
+            results.append(result)
+
+        # get the results
+        for result in results:
+            result.get()
+    
+def extract(img_path,number):
+    img = cv2.imread(img_path)
+    crop_img, crop_structure = findTable(img) # find table and descew it properly
+    centers = formCellsArray(crop_structure)
+    centers.sort(key=sortFunc)
+    getTableStructure(centers)
+    getSizeOfCells(centers)
+    getTextAndConf(centers, crop_img)
+    saveTableToXLSX(centers,number)
+    
+    
+# center, x, y, w, h, [right]5, [left]6, [top]7, [bottom]8, max_in_column 9, max_in_row 10, text 11
+
+interpolationDict = {0: cv2.INTER_NEAREST, 1: cv2.INTER_LINEAR, 2:cv2.INTER_CUBIC}
+
+
+def sortFunc(e):
+    return e[1] + e[2]
+
+def getContourCoords(cnt):
+    """
+
+    :param cnt: 
+
+    """
+
+    x,y,w,h = cv2.boundingRect(cnt)
+
+    center = [x + int(w/2), y + int(h/2)]
+
+    return center, x,y,w,h
+
+def rotatedRectWithMaxArea(w, h, angle):
+    """Given a rectangle of size wxh that has been rotated by 'angle' (in
+    radians), computes the width and height of the largest possible
+    axis-aligned rectangle (maximal area) within the rotated rectangle.
+
+    :param w: 
+    :param h: 
+    :param angle: 
+
+    """
+    if w <= 0 or h <= 0:
+        return 0,0
+
+    width_is_longer = w >= h
+    side_long, side_short = (w,h) if width_is_longer else (h,w)
+
+    # since the solutions for angle, -angle and 180-angle are all the same,
+    # if suffices to look at the first quadrant and the absolute values of sin,cos:
+    sin_a, cos_a = abs(math.sin(angle)), abs(math.cos(angle))
+    if side_short <= 2.*sin_a*cos_a*side_long or abs(sin_a-cos_a) < 1e-10:
+        # half constrained case: two crop corners touch the longer side,
+        # the other two corners are on the mid-line parallel to the longer line
+        x = 0.5*side_short
+        wr,hr = (x/sin_a,x/cos_a) if width_is_longer else (x/cos_a,x/sin_a)
+    else:
+        # fully constrained case: crop touches all 4 sides
+        cos_2a = cos_a*cos_a - sin_a*sin_a
+        wr,hr = (w*cos_a - h*sin_a)/cos_2a, (h*cos_a - w*sin_a)/cos_2a
+
+    return wr,hr
+
+def rotation(image, angleInDegrees, interpolation = 1):
+    """
+
+    :param image: 
+    :param angleInDegrees: 
+    :param interpolation:  (Default value = 1)
+
+    """
+    h, w = image.shape[:2]
+    img_c = (w / 2, h / 2)
+
+    wl,hl = rotatedRectWithMaxArea(w, h, math.radians(angleInDegrees))
+
+    rot = cv2.getRotationMatrix2D(img_c, angleInDegrees, 1)
+
+    rad = math.radians(angleInDegrees)
+    sin = math.sin(rad)
+    cos = math.cos(rad)
+    b_w = int(((h * abs(sin)) + (w * abs(cos))))
+    b_h = int(((h * abs(cos)) + (w * abs(sin))))
+
+    rot[0, 2] += ((b_w / 2) - img_c[0])
+    rot[1, 2] += ((b_h / 2) - img_c[1])
+    
+    outImg = cv2.warpAffine(image, rot, (b_w, b_h), flags = interpolationDict.get(interpolation), borderValue=(255, 255, 255, 0))
+
+    h, w = outImg.shape[:2]
+    center = (w / 2, h / 2)
+
+    topLeftPoint = (int(center[0] - wl/2), int(center[1] - hl/2))
+    bottomRightPoint = (int(center[0] + wl/2), int(center[1] + hl/2))
+
+    # cv2.rectangle(outImg,topLeftPoint,bottomRightPoint,(0,255,0),1)
+    
+    crop_img = outImg[topLeftPoint[1]+1:bottomRightPoint[1], topLeftPoint[0]+1:bottomRightPoint[0]]
+    # return outImg, crop_img
+    return outImg
+
+def findTable(img):
+    """Find table on (img) image and descew it properly
+
+    :param img: image with table on it
+
+    """
+
+    if len(img.shape) != 2:
+        imgray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        imgray = img
+
+    blur = cv2.bilateralFilter(imgray,9,75,75)
+
+    ret, thresh = cv2.threshold(blur,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+
+    contours, hierarchy = cv2.findContours(~thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
+
+    biggest_contour = max(contours, key = cv2.contourArea)
+    x,y,w,h = cv2.boundingRect(biggest_contour)
+
+    rect = cv2.minAreaRect(biggest_contour)
+    box = cv2.boxPoints(rect)
+    box = np.int0(box)
+
+    if abs(box[0][0] - box[1][0]) <= abs(box[0][1] - box[1][1]):
+        qq = box[0]
+        zz = box[1]
+    elif abs(box[1][0] - box[2][0]) <= abs(box[1][1] - box[2][1]):
+        qq = box[1]
+        zz = box[2]
+    elif abs(box[2][0] - box[3][0]) <= abs(box[2][1] - box[3][1]):
+        qq = box[2]
+        zz = box[3]
+    elif abs(box[0][0] - box[3][0]) <= abs(box[0][1] - box[3][1]):
+        qq = box[3]
+        zz = box[0]
+
+    center = [0, 0]
+    for i in box:
+        center[0] += i[0]
+        center[1] += i[1]
+    center[0] = int(center[0]/4)
+    center[1] = int(center[1]/4)
+
+    diff = box[0] - center
+    
+    angle = np.rad2deg(math.atan(abs(qq[0] - zz[0])/abs(qq[1] - zz[1])))
+    if diff[0] <= 0:
+        angle = -angle
+
+    crop_img = img[y:y+h,x:x+w].copy()
+
+    img2 = rotation(crop_img, angle)
+
+    output = findHorVerLines(img2) # find only horizontal and vertical lines on image, to find cells in table
+
+    contours, hierarchy = cv2.findContours(output, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    biggest_contour = max(contours, key = cv2.contourArea)
+    # cv2.drawContours(img, contours, -1, (0,0,255), 3)
+    x,y,w,h = cv2.boundingRect(biggest_contour)
+
+    crop_img = img2[y:y+h,x:x+w].copy()
+    crop_structure = output[y:y+h,x:x+w].copy()
+
+    return crop_img, crop_structure
+
+def resizeImage(img, scale_percent=50):
+    """
+
+    :param img: image to resize, does not modify image
+
+    :param scale_percent: scale multiplier in percents (Default value = 50)
+
+    :returns: resized image
+
+    """
+    #percent by which the image is resized
+    # scale_percent = 50
+
+    # scale_percent = max(100000/img.shape[0], 100000/img.shape[1])
+
+    # print(img.shape[1])
+    # print(img.shape[0])
+
+    #calculate the 50 percent of original dimensions
+    width = int(img.shape[1] * scale_percent / 100)
+    height = int(img.shape[0] * scale_percent / 100)
+
+    # print(width)
+    # print(height)
+
+    cv2.waitKey(0)
+
+    # dsize
+    dsize = (width, height)
+
+    # resize image
+    output = cv2.resize(img, dsize, interpolation=interpolationDict[1])
+    return output
+
+def findHorVerLines(img):
+    """
+    Get only horizontal and vertical lines from param img
+
+    :param img: source image
+
+    :returns: binary image where lines are white
+    """
+    # [gray]
+    # Transform source image to gray if it is not already
+    if len(img.shape) != 2:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+
+    gray = cv2.bitwise_not(gray)
+
+    den = cv2.bilateralFilter(gray,9,75,75)
+
+
+    # [bin]
+    # Apply adaptiveThreshold at the bitwise_not of gray
+    bw = cv2.adaptiveThreshold(den, 255, cv2.ADAPTIVE_THRESH_MEAN_C, \
+                                cv2.THRESH_BINARY, 13, -3) # -9
+
+    # Create the images that will use to extract the horizontal and vertical lines
+    horizontal = np.copy(bw)
+    vertical = np.copy(bw)
+    # Specify size on horizontal axis
+    cols = horizontal.shape[1]
+    horizontal_size = cols // 60
+    # Create structure element for extracting horizontal lines through morphology operations
+    horizontalStructure = cv2.getStructuringElement(cv2.MORPH_RECT, (horizontal_size, 1))
+    # Apply morphology operations
+    horizontal = cv2.erode(horizontal, horizontalStructure)
+    horizontal = cv2.dilate(horizontal, horizontalStructure)
+    # Specify size on vertical axis
+    rows = vertical.shape[0]
+    verticalsize = rows // 60
+    # Create structure element for extracting vertical lines through morphology operations
+    verticalStructure = cv2.getStructuringElement(cv2.MORPH_RECT, (1, verticalsize))
+    # Apply morphology operations
+    vertical = cv2.erode(vertical, verticalStructure)
+    vertical = cv2.dilate(vertical, verticalStructure)
+
+    output = vertical + horizontal
+    return output
+
+def is_overlapping(x1,x2,y1,y2, minPixelsToOverlap = 1):
+    """
+    https://stackoverflow.com/questions/3269434/whats-the-most-efficient-way-to-test-two-integer-ranges-for-overlap
+
+    Check if two lines [x1, x2], [y1, y2] are overlaping. Order of supplied borders doesnt matter
+
+    :param x1: first interval border 
+
+    :param x2: first interval border
+
+    :param y1: second interval border
+
+    :param y2: second interval border
+
+    :param minPixelsToOverlap: minimum value of overlapping pixel to confirm overlap (Default value = 1)
+    For default value, if intervals has only 1 overlapping number, function return False
+
+    :return value: True if intervals overlap, False otherwise
+
+    """
+    x2 +=x1
+    y2 +=y1
+    # print(min(x2,y2) - max(x1,y1))
+    return min(x2,y2) - max(x1,y1) > minPixelsToOverlap
+    # if x1 <= x2 and y1 <= y2:
+    #     return x1 <= y2 and y1 <= x2
+    # else:
+    #     x = min(x1, x2)
+    #     y = min(y1, y2)
+    #     x3 = max(x1, x2)
+    #     y3 = max(y1, y2)
+    #     return x <= y3 and y <= x3
+
+def isNeighbor(a, b, e=5):
+    """
+    Check if cells(contours) a and b has overlapping borders
+
+    :param a: first cell
+
+    :param b: second cell
+
+    :param e: epsilon value, to guarantee that not perfectly lined cells checked too (Default value = 5)
+
+    """
+    x, y, w, h = a[1:5]
+    x2, y2, w2, h2 = b[1:5]
+
+    # isAinB(x2, x+w, e)
+    # x+w-e <= x2 <= x+w+e
+
+    # # check right side
+    # if isAinB(x2, x+w, e) and y-e <= y2 <= y+h+e and y-e <= y2+h2 <= y+h+e:
+    #     return 0
+    
+    # # check left side
+    # if isAinB(x, x2+w2, e) and (y-e <= y2 <= y+h+e and y-e <= y2+h2 <= y+h+e or y2-e <= y <= y2+h2+e and y2-e <= y+h <= y2+h2+e):
+    #     return 1
+    
+    # # check top side
+    # if isAinB(y2, y-h2, e) and x-e <= x2 <= x+w+e and x-e <= x2+w2 <= x+w+e:
+    #     return 2
+    
+    # # check bottom side
+    # if isAinB(y2, y+h, e) and x-e <= x2 <= x+w+e and x-e <= x2+w2 <= x+w+e:
+    #     return 3
+    
+    # check right side
+    if isAinB(x2, x+w, e) and is_overlapping(y, h, y2, h2):
+        return 0
+    
+    # check left side
+    if isAinB(x, x2+w2, e) and is_overlapping(y, h, y2, h2):
+        return 1
+    
+    # check top side
+    if isAinB(y2, y-h2, e) and is_overlapping(x, w, x2, w2):
+        return 2
+    
+    # check bottom side
+    if isAinB(y2, y+h, e) and is_overlapping(x, w, x2, w2):
+        return 3
+    
+    return -1
+
+def isAinB(a, b, e):
+    """
+    Is point a in interval [b-e, b+e]
+    """
+    return b-e <= a <= b+e
+
+def getTableStructure(cells):
+    """
+    Find and add info about cells neighbors [right], [left], [top], [bottom]
+
+    :param cells: list of cells
+
+    :return value: modified list with info about neighbors
+
+    """
+    # center, x, y, w, h, [right]5, [left]6, [top]7, [bottom]8,
+    for i in range(len(cells)):
+        cells[i].append(list())
+        cells[i].append(list())
+        cells[i].append(list())
+        cells[i].append(list())
+        for j in range(len(cells)):
+            ret = isNeighbor(cells[i], cells[j], 10)
+            if ret > -1:
+                # print(ret)
+                cells[i][5 + ret].append(j)
+    
+        cells[i][5].sort(key=lambda x: cells[x][2])
+        cells[i][6].sort(key=lambda x: cells[x][2])
+        cells[i][7].sort(key=lambda x: cells[x][1])
+        cells[i][8].sort(key=lambda x: cells[x][1])
+    
+    # for i in cells:
+    #     print(i)
+                
+def getSizeOfCells(cells):
+    # center, x, y, w, h, [right]5, [left]6, [top]7, [bottom]8, max_in_column, max_in_row
+
+    def func12(cells, dir, i):
+        max = 1
+        main_cell = cells[i]
+        target_cells = list()
+        target_cells.append(i)
+        unique_x_vals = list()
+        unique_y_vals = list()
+
+        while len(target_cells) != 0:
+            new_target_cells = list()
+
+            if dir == 7 or dir == 8:
+                index = 1
+            else:
+                index = 2
+
+
+            for j in target_cells:
+                for k in cells[j][dir]:
+                    new_target_cells.append(k)
+
+
+            new_unique_x_vals = list()
+            new_unique_y_vals = list()
+            for j in target_cells:
+                x = cells[j][1]
+                y = cells[j][2]
+
+                if len(unique_x_vals) == 0:
+                    new_unique_x_vals.append(x)
+                if len(unique_y_vals) == 0:
+                    new_unique_y_vals.append(y)
+
+                counter = 0
+                for k in unique_x_vals:
+                    if isAinB(x, k, 15):
+                        counter += 1
+                        break
+
+                if counter == 0:
+                    new_unique_x_vals.append(x)
+
+                counter = 0 
+                for k in unique_y_vals:
+                    if isAinB(y, k, 15):
+                        counter += 1
+                        break
+                
+                if counter == 0:
+                    new_unique_y_vals.append(y)
+
+                unique_x_vals = list(set(unique_x_vals + new_unique_x_vals))
+                unique_y_vals = list(set(unique_y_vals + new_unique_y_vals))
+
+            unique_x_vals.sort()
+            unique_y_vals.sort()
+
+            if len(new_target_cells) == 0:
+                break
+
+            # 2
+            target_cells = list(set(new_target_cells))
+
+            # 3
+            index_to_remove = list()
+            for j in target_cells:
+                if not is_overlapping(main_cell[index], main_cell[index+2], cells[j][index], cells[j][index+2], int(min(main_cell[index+2], cells[j][index+2])*0.3) ): # int(main_cell[3] * 0.8)
+                    index_to_remove.append(j)
+
+            for j in index_to_remove:        
+                target_cells.remove(j)
+
+            unique_cells_count = len(target_cells)
+            # print("unique: ", unique_cells_count)
+            if unique_cells_count > max:
+                max = unique_cells_count
+
+
+        target_cells.clear()
+
+        # return max
+        if dir == 8 or dir == 7:
+            unique_x_vals[:] = filterfalse(lambda x: isAinB(x, main_cell[0][0], main_cell[3]/2 + 20) is False, unique_x_vals)
+            return len(unique_x_vals)
+        else:
+            unique_y_vals[:] = filterfalse(lambda y: isAinB(y, main_cell[0][1], main_cell[4]/2 + 20) is False, unique_y_vals)
+            return len(unique_y_vals)
+
+    for i in range(len(cells)):
+        main_cell = cells[i]
+        target_cells = list()
+        target_cells.append(i) 
+
+        a = func12(cells, 8, i)
+        b = func12(cells, 7, i)
+        c = func12(cells, 6, i)
+        d = func12(cells, 5, i)
+        cells[i].append(max(a, b)) # max(a, b)
+        cells[i].append(max(c, d)) # max(c, d)
+        
+def formCellsArray(crop_structure):
+    contours, hierarchy = cv2.findContours(crop_structure, cv2.RETR_CCOMP , cv2.CHAIN_APPROX_SIMPLE)
+
+    centers = list()
+
+    for i in range(len(contours)):
+        cnt = contours[i]   
+        hrr = hierarchy[0][i]
+        if hrr[3] == -1:
+            continue
+        margin = 5
+        center = list(getContourCoords(cnt))
+        if center[3] < margin*2 or center[4] < margin*2:
+            continue
+
+        centers.append(center)
+
+    return centers
+
+def saveTableToXLSX(centers,number):
+    wb = Workbook()
+
+    # grab the active worksheet
+    ws = wb.active
+
+    cells_to_draw = list()
+    cells_to_draw.append(0)
+
+    while len(cells_to_draw) > 0:
+        index = cells_to_draw.pop()
+        cell = centers[index]
+
+        # copy all neighbors
+        cells_to_draw += cell[5].copy() + cell[6].copy() + cell[7].copy() + cell[8].copy()
+
+        cells_to_draw[:] = filterfalse(lambda x : centers[x][12] is True, cells_to_draw)
+
+
+        cell[12] = True
+        text = cell[11]
+        conf = cell[13]
+
+        row_num = 0
+        column_num = 0
+
+        cell_height = cell[10]
+        cell_width = cell[9]
+
+        ind = index
+
+        while len(cell[7]) > 0:
+            ind = cell[7][0]
+            row_num += centers[ind][10]
+            cell = centers[ind]
+        
+        cell = centers[index]
+        while len(cell[6]) > 0:
+            ind = cell[6][0]
+            column_num += centers[ind][9]
+            cell = centers[ind]
+
+        
+        cell_to_style = ws._get_cell(row_num+1, column_num+1)
+
+        ws.cell(column=column_num+1, row=row_num+1, value=text)
+
+        if cell_height > 1 or cell_width > 1:    
+            ws.merge_cells(start_row=row_num+1, start_column=column_num+1, end_row=row_num+cell_height, end_column=column_num+cell_width)
+
+    # Save the file
+    wb.save(f'csv_classification/{number}.csv')
+
+def getTextAndConf(centers, crop_img):
+    count = 0
+
+    for i in range(len(centers)):
+        center, x, y, w, h = centers[i][0:5]
+        margin = int(max(min(w, h)/15, 2))
+        roi = crop_img[y+margin:y+h-margin,x+margin:x+w-margin].copy()
+
+        if len(roi.shape) != 2:
+            roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        th2 = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 21)
+        thval = cv2.countNonZero(th2)
+        dst = cv2.inRange(roi, 0, 60)
+        dstval = cv2.countNonZero(~dst)
+        height, width = dst.shape
+        _, ret = cv2.threshold(roi,200,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+
+        conf = 100
+        text = ""
+
+        if thval/(height*width) < 0.999 :
+#             data = pytesseract.image_to_string(ret, lang="pol+eng", config='--psm 6')
+            data = reader.readtext(ret)
+            data = ' '.join([item[1] for item in data if item[2]>0.3])
+
+            text = data
+
+        centers[i].append(text)
+        centers[i].append(False)
+        centers[i].append(conf)
